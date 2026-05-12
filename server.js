@@ -1,3 +1,5 @@
+console.log('[SERVER] Booting — Shopify sync build active');
+
 const express = require('express');
 const dotenv = require('dotenv');
 const connectDB = require('./config/db');
@@ -12,14 +14,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB, then start background sync job
-connectDB().then(() => {
-    console.log('[SERVER] DB ready — starting Shopify sync job...');
+// Connect to MongoDB (Mongoose buffers queries until connected)
+connectDB();
+
+// Start the Shopify sync cron unconditionally — it tolerates the DB not being ready yet
+try {
     const { startShopifySyncJob } = require('./cron/shopifySyncJob');
     startShopifySyncJob();
-}).catch(err => {
+} catch (err) {
     console.error('[SERVER] Failed to start Shopify sync job:', err.message, err.stack);
-});
+}
 
 // Routes
 app.use('/api/products', authenticateToken, productRoutes);
