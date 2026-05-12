@@ -14,8 +14,11 @@ app.use(express.json());
 
 // Connect to MongoDB, then start background sync job
 connectDB().then(() => {
+    console.log('[SERVER] DB ready — starting Shopify sync job...');
     const { startShopifySyncJob } = require('./cron/shopifySyncJob');
     startShopifySyncJob();
+}).catch(err => {
+    console.error('[SERVER] Failed to start Shopify sync job:', err.message, err.stack);
 });
 
 // Routes
