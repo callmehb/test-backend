@@ -14,16 +14,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB (Mongoose buffers queries until connected)
-connectDB();
-
-// Start the Shopify sync cron unconditionally — it tolerates the DB not being ready yet
-try {
+// Connect to MongoDB, then start the sync job (ensures DB is ready before first run)
+connectDB().then(() => {
     const { startShopifySyncJob } = require('./cron/shopifySyncJob');
     startShopifySyncJob();
-} catch (err) {
+}).catch(err => {
     console.error('[SERVER] Failed to start Shopify sync job:', err.message, err.stack);
-}
+});
 
 // Routes
 app.use('/api/products', authenticateToken, productRoutes);
