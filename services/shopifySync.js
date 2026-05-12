@@ -13,20 +13,20 @@ let cachedToken = null;
 let tokenExpiresAt = 0;
 
 async function fetchAccessToken() {
+    const params = new URLSearchParams({
+        grant_type: (process.env.grant_type || '').trim(),
+        client_id: (process.env.client_id || '').trim(),
+        client_secret: (process.env.client_secret || '').trim()
+    });
     const res = await fetch(TOKEN_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            grant_type: (process.env.grant_type || '').trim(),
-            client_id: (process.env.client_id || '').trim(),
-            client_secret: (process.env.client_secret || '').trim()
-        })
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
     });
     if (!res.ok) throw new Error(`Token fetch failed HTTP ${res.status}: ${await res.text()}`);
     const data = await res.json();
     if (!data.access_token) throw new Error(`Token response missing access_token: ${JSON.stringify(data)}`);
     cachedToken = data.access_token;
-    // Default to 24h if expires_in not provided; refresh 60s before expiry
     const expiresIn = data.expires_in ?? 86400;
     tokenExpiresAt = Date.now() + (expiresIn - 60) * 1000;
     console.log('[SHOPIFY SYNC] Access token refreshed.');
@@ -47,7 +47,6 @@ async function shopifyGraphQL(query, variables = {}, isRetry = false) {
         body: JSON.stringify({ query, variables })
     });
     if (res.status === 401 && !isRetry) {
-        // Force token refresh and retry once
         cachedToken = null;
         tokenExpiresAt = 0;
         return shopifyGraphQL(query, variables, true);
@@ -66,6 +65,7 @@ async function fetchShopifyIds(sku) {
                 edges {
                     node {
                         id
+                        product { id }
                         inventoryItem {
                             id
                             inventoryLevels(first: 1) {
@@ -85,6 +85,7 @@ async function fetchShopifyIds(sku) {
     const levelEdges = item.inventoryLevels.edges;
     if (!levelEdges.length) return null;
     return {
+        shopifyProductId: node.product.id,
         variantId: node.id,
         inventoryItemId: item.id,
         locationId: levelEdges[0].node.location.id
@@ -116,26 +117,26 @@ async function sendInventoryBatch(items) {
     if (errors.length) throw new Error(`inventorySetQuantities userErrors: ${JSON.stringify(errors)}`);
 }
 
-function esc(val) {
-    return (val ?? '').toString().replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
-async function sendVariantBatch(items) {
-    const body = items.map((item, i) =>
-        `v${i}: productVariantUpdate(input: { id: "${esc(item.variantId)}", price: "${item.price.toFixed(2)}", barcode: "${esc(item.barcode)}" }) { userErrors { field message } }`
-    ).join('\n');
-    const json = await shopifyGraphQL(`mutation { ${body} }`);
-    const allErrors = items.flatMap((_, i) => json.data[`v${i}`]?.userErrors ?? []);
-    if (allErrors.length) throw new Error(`productVariantUpdate userErrors: ${JSON.stringify(allErrors)}`);
-}
-
-async function sendCostBatch(items) {
-    const body = items.map((item, i) =>
-        `c${i}: inventoryItemUpdate(id: "${esc(item.inventoryItemId)}", input: { cost: "${item.cost.toFixed(2)}" }) { userErrors { field message } }`
-    ).join('\n');
-    const json = await shopifyGraphQL(`mutation { ${body} }`);
-    const allErrors = items.flatMap((_, i) => json.data[`c${i}`]?.userErrors ?? []);
-    if (allErrors.length) throw new Error(`inventoryItemUpdate userErrors: ${JSON.stringify(allErrors)}`);
+// Sends price, barcode, and cost for a group of variants belonging to ONE Shopify product
+async function sendVariantUpdate(shopifyProductId, variants) {
+    const mutation = `
+        mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+            productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                userErrors { field message }
+            }
+        }
+    `;
+    const json = await shopifyGraphQL(mutation, {
+        productId: shopifyProductId,
+        variants: variants.map(v => ({
+            id: v.variantId,
+            price: v.price.toFixed(2),
+            barcode: v.barcode ?? '',
+            inventoryItem: { cost: v.cost.toFixed(2) }
+        }))
+    });
+    const errors = json.data.productVariantsBulkUpdate.userErrors;
+    if (errors.length) throw new Error(`productVariantsBulkUpdate userErrors: ${JSON.stringify(errors)}`);
 }
 
 // ── Main sync ─────────────────────────────────────────────────────────────────
@@ -160,18 +161,16 @@ async function runSync() {
         const stateMap = new Map(syncStates.map(s => [s.productId.toString(), s]));
 
         const inventoryItems = [];
-        const variantItems = [];
-        const costItems = [];
+        const variantItems = [];   // price + barcode + cost together
         const missingSkuUpserts = [];
-        const resolvedIds = new Map(); // pid -> { variantId, inventoryItemId, locationId }
+        const resolvedIds = new Map();
 
         for (const product of products) {
             const pid = product._id.toString();
             let state = stateMap.get(pid);
 
-            // Reset cached Shopify IDs if SKU changed
             if (state && state.sku !== product.sku) {
-                state = { ...state, variantId: null, inventoryItemId: null, locationId: null, shopifySkuMissing: false };
+                state = { ...state, shopifyProductId: null, variantId: null, inventoryItemId: null, locationId: null, shopifySkuMissing: false };
             }
 
             if (state?.shopifySkuMissing) continue;
@@ -182,15 +181,15 @@ async function runSync() {
             const currentBarcode = product.barcode ?? '';
 
             const qtyChanged = product.trackQuantity && (state == null || currentQty !== state.lastSyncedQuantity);
-            const priceChanged = state == null || currentPrice !== state.lastSyncedPrice;
-            const costChanged = state == null || currentCost !== state.lastSyncedCost;
-            const barcodeChanged = state == null || currentBarcode !== (state.lastSyncedBarcode ?? '');
+            const variantChanged = state == null
+                || currentPrice !== state.lastSyncedPrice
+                || currentCost !== state.lastSyncedCost
+                || currentBarcode !== (state.lastSyncedBarcode ?? '');
 
-            if (!qtyChanged && !priceChanged && !costChanged && !barcodeChanged) continue;
+            if (!qtyChanged && !variantChanged) continue;
 
-            // Resolve Shopify IDs — use cache or fetch
-            let { variantId, inventoryItemId, locationId } = state || {};
-            if (!variantId || !inventoryItemId || !locationId) {
+            let { shopifyProductId, variantId, inventoryItemId, locationId } = state || {};
+            if (!shopifyProductId || !variantId || !inventoryItemId || !locationId) {
                 try {
                     const ids = await fetchShopifyIds(product.sku);
                     if (!ids) {
@@ -203,23 +202,20 @@ async function runSync() {
                         });
                         continue;
                     }
-                    variantId = ids.variantId;
-                    inventoryItemId = ids.inventoryItemId;
-                    locationId = ids.locationId;
+                    ({ shopifyProductId, variantId, inventoryItemId, locationId } = ids);
                 } catch (err) {
                     console.error(`[SHOPIFY SYNC] Failed to fetch Shopify IDs for SKU "${product.sku}":`, err.message);
                     continue;
                 }
             }
 
-            resolvedIds.set(pid, { variantId, inventoryItemId, locationId });
+            resolvedIds.set(pid, { shopifyProductId, variantId, inventoryItemId, locationId });
 
             if (qtyChanged)
                 inventoryItems.push({ productId: product._id, quantity: currentQty, inventoryItemId, locationId });
-            if (priceChanged || barcodeChanged)
-                variantItems.push({ productId: product._id, price: currentPrice, barcode: currentBarcode, variantId });
-            if (costChanged)
-                costItems.push({ productId: product._id, cost: currentCost, inventoryItemId });
+
+            if (variantChanged)
+                variantItems.push({ productId: product._id, shopifyProductId, variantId, price: currentPrice, cost: currentCost, barcode: currentBarcode });
         }
 
         if (missingSkuUpserts.length) {
@@ -228,14 +224,15 @@ async function runSync() {
             );
         }
 
-        if (!inventoryItems.length && !variantItems.length && !costItems.length) {
+        if (!inventoryItems.length && !variantItems.length) {
             console.log('[SHOPIFY SYNC] No changes to push.');
             return;
         }
 
         const now = new Date();
-        const successMap = new Map(); // pid -> { quantity?, price?, barcode?, cost? }
+        const successMap = new Map();
 
+        // Inventory (quantity) batches
         for (let i = 0; i < inventoryItems.length; i += BATCH_SIZE) {
             const batch = inventoryItems.slice(i, i + BATCH_SIZE);
             try {
@@ -251,36 +248,28 @@ async function runSync() {
             }
         }
 
-        for (let i = 0; i < variantItems.length; i += BATCH_SIZE) {
-            const batch = variantItems.slice(i, i + BATCH_SIZE);
+        // Variant (price/barcode/cost) — group by shopifyProductId, send one mutation per product
+        const byProduct = new Map();
+        for (const item of variantItems) {
+            if (!byProduct.has(item.shopifyProductId)) byProduct.set(item.shopifyProductId, []);
+            byProduct.get(item.shopifyProductId).push(item);
+        }
+
+        for (const [shopifyProductId, variants] of byProduct) {
             try {
-                await sendVariantBatch(batch);
-                for (const item of batch) {
+                await sendVariantUpdate(shopifyProductId, variants);
+                for (const item of variants) {
                     const pid = item.productId.toString();
                     if (!successMap.has(pid)) successMap.set(pid, {});
-                    Object.assign(successMap.get(pid), { price: item.price, barcode: item.barcode });
+                    Object.assign(successMap.get(pid), { price: item.price, cost: item.cost, barcode: item.barcode });
                 }
-                console.log(`[SHOPIFY SYNC] Pushed price/barcode for ${batch.length} item(s).`);
+                console.log(`[SHOPIFY SYNC] Pushed price/barcode/cost for ${variants.length} variant(s) of product ${shopifyProductId}.`);
             } catch (err) {
-                console.error('[SHOPIFY SYNC] Variant batch failed:', err.message);
+                console.error(`[SHOPIFY SYNC] Variant update failed for product ${shopifyProductId}:`, err.message);
             }
         }
 
-        for (let i = 0; i < costItems.length; i += BATCH_SIZE) {
-            const batch = costItems.slice(i, i + BATCH_SIZE);
-            try {
-                await sendCostBatch(batch);
-                for (const item of batch) {
-                    const pid = item.productId.toString();
-                    if (!successMap.has(pid)) successMap.set(pid, {});
-                    successMap.get(pid).cost = item.cost;
-                }
-                console.log(`[SHOPIFY SYNC] Pushed cost for ${batch.length} item(s).`);
-            } catch (err) {
-                console.error('[SHOPIFY SYNC] Cost batch failed:', err.message);
-            }
-        }
-
+        // Persist sync state
         const stateUpserts = [];
         for (const [pid, updates] of successMap) {
             const product = productMap.get(pid);
@@ -288,6 +277,7 @@ async function runSync() {
             const setFields = {
                 productId: product._id,
                 sku: product.sku,
+                shopifyProductId: ids.shopifyProductId,
                 variantId: ids.variantId,
                 inventoryItemId: ids.inventoryItemId,
                 locationId: ids.locationId,
@@ -296,8 +286,8 @@ async function runSync() {
             };
             if ('quantity' in updates) setFields.lastSyncedQuantity = updates.quantity;
             if ('price' in updates) setFields.lastSyncedPrice = updates.price;
-            if ('barcode' in updates) setFields.lastSyncedBarcode = updates.barcode;
             if ('cost' in updates) setFields.lastSyncedCost = updates.cost;
+            if ('barcode' in updates) setFields.lastSyncedBarcode = updates.barcode;
 
             stateUpserts.push({
                 updateOne: {

@@ -9,6 +9,7 @@ const shopifySyncStateSchema = new mongoose.Schema({
         index: true
     },
     sku: { type: String, required: true },
+    shopifyProductId: { type: String, default: null },
     variantId: { type: String, default: null },
     inventoryItemId: { type: String, default: null },
     locationId: { type: String, default: null },
