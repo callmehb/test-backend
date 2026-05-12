@@ -4,7 +4,7 @@ const cron = require('node-cron');
 const { runSync } = require('../services/shopifySync');
 
 function startShopifySyncJob() {
-    cron.schedule('*/15 * * * *', async () => {
+    cron.schedule('*/2 * * * *', async () => {
         try {
             await runSync();
         } catch (err) {
