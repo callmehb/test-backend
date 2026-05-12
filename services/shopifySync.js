@@ -62,21 +62,23 @@ async function fetchShopifyIds(sku) {
 
 async function sendBulkMutation(items) {
     const mutation = `
-        mutation($quantities: [InventorySetQuantityInput!]!) {
-            inventorySetQuantities(input: {
-                reason: "correction"
-                setQuantities: $quantities
-            }) {
+        mutation($input: InventorySetQuantitiesInput!) {
+            inventorySetQuantities(input: $input) {
                 userErrors { field message }
             }
         }
     `;
     const json = await shopifyGraphQL(mutation, {
-        quantities: items.map(i => ({
-            inventoryItemId: i.inventoryItemId,
-            locationId: i.locationId,
-            quantity: i.quantity
-        }))
+        input: {
+            name: "available",
+            reason: "correction",
+            ignoreCompareQuantity: true,
+            quantities: items.map(i => ({
+                inventoryItemId: i.inventoryItemId,
+                locationId: i.locationId,
+                quantity: i.quantity
+            }))
+        }
     });
     const userErrors = json.data.inventorySetQuantities.userErrors;
     if (userErrors.length) {
