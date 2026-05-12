@@ -12,8 +12,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB
-connectDB();
+// Connect to MongoDB, then start background sync job
+connectDB().then(() => {
+    const { startShopifySyncJob } = require('./cron/shopifySyncJob');
+    startShopifySyncJob();
+});
 
 // Routes
 app.use('/api/products', authenticateToken, productRoutes);
