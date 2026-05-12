@@ -15,12 +15,12 @@ let tokenExpiresAt = 0;
 async function fetchAccessToken() {
     const res = await fetch(TOKEN_URL, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'grant_type': (process.env.grant_type || '').trim(),
-            'client_id': (process.env.client_id || '').trim(),
-            'client_secret': (process.env.client_secret || '').trim()
-        }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            grant_type: (process.env.grant_type || '').trim(),
+            client_id: (process.env.client_id || '').trim(),
+            client_secret: (process.env.client_secret || '').trim()
+        })
     });
     if (!res.ok) throw new Error(`Token fetch failed HTTP ${res.status}: ${await res.text()}`);
     const data = await res.json();
